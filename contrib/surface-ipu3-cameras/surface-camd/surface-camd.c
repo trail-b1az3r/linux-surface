@@ -52,6 +52,24 @@
 
 #include "ipu3-unpack.h"
 
+/*
+ * v4l2loopback control device (/dev/v4l2loopback, v4l2loopback >= 0.12.5):
+ * lets us create our own loopback device at runtime, independent of the
+ * module options other programs (OBS, Iriun, virtual camera scripts) set.
+ * Layout as in v4l2loopback.h.
+ */
+struct v4l2_loopback_config {
+	__s32 output_nr;
+	__s32 unused;
+	char card_label[32];
+	__u32 min_width, max_width, min_height, max_height;
+	__s32 max_buffers;
+	__s32 max_openers;
+	__s32 debug;
+	__s32 announce_all_caps;
+};
+#define V4L2LOOPBACK_CTL_ADD _IOW('~', 1, struct v4l2_loopback_config)
+
 /* v4l2loopback private event: number of capture clients changed. */
 #ifndef V4L2_EVENT_PRI_CLIENT_USAGE
 #define V4L2_EVENT_PRI_CLIENT_USAGE (V4L2_EVENT_PRIVATE_START + 0x08E00000 + 1)
@@ -262,6 +280,7 @@ struct cam {
 	/* configuration */
 	const char *sensor_prefix;
 	const char *output;
+	const char *label;		/* name for a loopback device we create */
 	const char *led_path;
 	unsigned int req_w, req_h;
 	int black_level;
@@ -691,6 +710,39 @@ static void stream_off(struct cam *c)
 
 /* -------------------------------------------------------------- output */
 
+/* Create c->output (/dev/videoN) as a v4l2loopback device. 0 on success. */
+static int create_loopback(struct cam *c)
+{
+	struct v4l2_loopback_config cfg;
+	unsigned int nr;
+	char tail;
+	int fd, r;
+
+	if (sscanf(c->output, "/dev/video%u%c", &nr, &tail) != 1)
+		return -1;	/* not a /dev/videoN path we could create */
+	fd = open("/dev/v4l2loopback", O_RDWR | O_CLOEXEC);
+	if (fd < 0) {
+		/* Module not loaded yet: load it (the service runs as root). */
+		if (errno == ENOENT && system("modprobe -q v4l2loopback") == 0)
+			fd = open("/dev/v4l2loopback", O_RDWR | O_CLOEXEC);
+		if (fd < 0)
+			return -1;
+	}
+	memset(&cfg, 0, sizeof(cfg));
+	cfg.output_nr = (__s32)nr;
+	cfg.unused = (__s32)nr;	/* same number: one device for output and capture */
+	snprintf(cfg.card_label, sizeof(cfg.card_label), "%s",
+		 c->label ? c->label : "surface-camd");
+	cfg.announce_all_caps = 0;	/* exclusive caps: needed by Chrome/Electron */
+	r = ioctl(fd, V4L2LOOPBACK_CTL_ADD, &cfg);
+	if (r < 0 && errno != EEXIST)
+		logmsg("creating %s via /dev/v4l2loopback failed: %s", c->output, strerror(errno));
+	else
+		logmsg("created %s (\"%s\")", c->output, cfg.card_label);
+	close(fd);
+	return r < 0 && errno != EEXIST ? -1 : 0;
+}
+
 static void setup_output(struct cam *c)
 {
 	struct v4l2_format f;
@@ -704,17 +756,23 @@ static void setup_output(struct cam *c)
 		c->oh = c->h;
 	}
 
-	/* After boot the v4l2loopback devices can appear a bit later. */
-	for (int t = 0;; t++) {
+	/* Use the device if it exists, otherwise create it through the
+	 * v4l2loopback control device (the module may still be loading at boot). */
+	for (int t = 0;; t++) {		/* t counts 200 ms steps */
 		c->out_fd = open(c->output, O_RDWR | O_NONBLOCK | O_CLOEXEC);
-		if (c->out_fd >= 0 || errno != ENOENT || t >= c->wait_s || g_stop)
+		if (c->out_fd >= 0 || errno != ENOENT)
 			break;
-		sleep(1);
+		/* EEXIST counts as success: udev may just not have made the node yet */
+		create_loopback(c);
+		if (t >= (c->wait_s + 2) * 5 || g_stop)
+			break;
+		usleep(200000);
 	}
 	if (c->out_fd < 0)
-		die("Cannot open output %s: %s (is v4l2loopback loaded with the surface-camd "
-		    "options? sudo modprobe -r v4l2loopback; sudo modprobe v4l2loopback)",
-		    c->output, strerror(errno));
+		errno = ENOENT;
+	if (c->out_fd < 0)
+		die("Cannot open or create output %s: %s. Is the v4l2loopback module installed? "
+		    "(sudo modprobe v4l2loopback; ls /dev/v4l2loopback)", c->output, strerror(errno));
 
 	memset(&f, 0, sizeof(f));
 	f.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
@@ -1089,14 +1147,17 @@ int main(int argc, char **argv)
 		if (!strcmp(camera, "front")) {
 			c.sensor_prefix = "ov5693";
 			default_out = "/dev/video50";
+			c.label = "Surface Front Camera";
 			def_w = 2592, def_h = 1944;	/* -> 1296x972 output */
 		} else if (!strcmp(camera, "rear")) {
 			c.sensor_prefix = "ov8865";
 			default_out = "/dev/video51";
+			c.label = "Surface Rear Camera";
 			def_w = 3264, def_h = 2448;	/* -> 1632x1224 output */
 		} else if (!strcmp(camera, "ir")) {
 			c.sensor_prefix = "ov7251";
 			default_out = "/dev/video52";
+			c.label = "Surface IR Camera";
 		} else
 			die("unknown camera '%s'", camera);
 	}

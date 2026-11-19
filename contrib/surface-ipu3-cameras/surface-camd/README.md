@@ -52,7 +52,7 @@ To do it by hand:
 # needs: gcc, make, linux headers for your running kernel, v4l2loopback(-dkms)
 make && make test
 sudo make install
-sudo modprobe -r v4l2loopback; sudo modprobe v4l2loopback
+sudo modprobe v4l2loopback
 sudo systemctl daemon-reload
 sudo systemctl enable --now surface-camd@front surface-camd@rear surface-camd@ir
 ffplay /dev/video50
@@ -99,11 +99,11 @@ offering the libcamera versions of the cameras.
 - *"Enabling link ... failed: Device or resource busy"* means another
   program (usually libcamera through PipeWire) is using the camera. See the
   previous section.
-- *"Cannot open output /dev/video50"* means v4l2loopback isn't loaded with
-  the config from `v4l2loopback-surface.conf`. Another tool's
-  `options v4l2loopback` file can override it; `../surface-camera-setup.sh`
-  lists them. Reload with
-  `sudo modprobe -r v4l2loopback && sudo modprobe v4l2loopback`.
+- *"Cannot open or create output /dev/video50"* means the v4l2loopback
+  module is missing. surface-camd creates `/dev/video50`–`52` itself,
+  through v4l2loopback's control device `/dev/v4l2loopback`, so other
+  programs' v4l2loopback options (OBS, Iriun, virtual camera scripts) don't
+  get in the way. Check with `sudo modprobe v4l2loopback; ls /dev/v4l2loopback`.
 - The camera is only reserved while an app is watching. Logs show
   "streaming started", "first frame received" and "streaming stopped (N frames)".
 

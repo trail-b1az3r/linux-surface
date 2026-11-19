@@ -40,7 +40,6 @@ make install DESTDIR=%{buildroot} PREFIX=/usr \
 %files
 /usr/bin/surface-camd
 /usr/lib/systemd/system/surface-camd@.service
-/usr/lib/modprobe.d/v4l2loopback-surface.conf
 /usr/lib/modprobe.d/surface-ipu3-cameras.conf
 /usr/lib/modules-load.d/v4l2loopback-surface.conf
 /usr/share/wireplumber/wireplumber.conf.d/51-surface-ipu3-cameras.conf
