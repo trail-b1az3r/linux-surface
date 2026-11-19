@@ -220,6 +220,17 @@ fi
 
 # ----------------------------------------------------------------- install
 step "Installing"
+# Leftovers of a manual "make install" (e.g. older surface-camera-setup.sh
+# --fix) in /usr/local and /etc take priority over the package: remove them.
+if [ "$DISTRO" != other ]; then
+    for f in /usr/local/bin/surface-camd /etc/systemd/system/surface-camd@.service \
+             /etc/modprobe.d/v4l2loopback-surface.conf /etc/modules-load.d/v4l2loopback-surface.conf; do
+        if [ -e "$f" ]; then
+            $SUDO rm -f "$f"
+            ok "removed old manual install: $f"
+        fi
+    done
+fi
 case "$DISTRO" in
     arch)   $SUDO pacman -U --noconfirm "$PKG";;
     debian) $SUDO apt-get install -y "$PKG";;
@@ -237,10 +248,8 @@ fi
 step "Loading modules and starting cameras"
 $SUDO systemctl daemon-reload
 stop_services
-# Reload v4l2loopback so it picks up the Surface device names/numbers.
-if [ -d /sys/module/v4l2loopback ] && ! $SUDO modprobe -r v4l2loopback 2>/dev/null; then
-    warn "v4l2loopback is in use (OBS?); close it and re-run, or reboot"
-fi
+# surface-camd creates /dev/video50-52 itself through /dev/v4l2loopback, so
+# other programs' v4l2loopback options (OBS, Iriun, ...) don't matter.
 if ! $SUDO modprobe v4l2loopback; then
     warn "v4l2loopback failed to load. If you just updated the kernel, reboot and re-run."
     warn "Check: dkms status"

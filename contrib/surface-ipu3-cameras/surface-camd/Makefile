@@ -29,7 +29,6 @@ install: surface-camd
 	install -D -m 0755 surface-camd $(DESTDIR)$(PREFIX)/bin/surface-camd
 	install -D -m 0644 surface-camd@.service $(DESTDIR)$(SYSTEMDUNITDIR)/surface-camd@.service
 	sed -i 's|@BINDIR@|$(PREFIX)/bin|' $(DESTDIR)$(SYSTEMDUNITDIR)/surface-camd@.service
-	install -D -m 0644 v4l2loopback-surface.conf $(DESTDIR)$(MODPROBEDIR)/v4l2loopback-surface.conf
 	install -D -m 0644 ../modprobe.d/surface-ipu3-cameras.conf $(DESTDIR)$(MODPROBEDIR)/surface-ipu3-cameras.conf
 	install -D -m 0644 v4l2loopback-load.conf $(DESTDIR)$(MODULESLOADDIR)/v4l2loopback-surface.conf
 	install -D -m 0644 ../wireplumber/51-surface-ipu3-cameras.conf $(DESTDIR)$(WIREPLUMBERDIR)/51-surface-ipu3-cameras.conf
