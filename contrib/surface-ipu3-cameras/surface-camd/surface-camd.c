@@ -283,7 +283,10 @@ struct cam {
 	const char *label;		/* name for a loopback device we create */
 	const char *led_path;
 	unsigned int req_w, req_h;
+	unsigned int out_w, out_h;	/* requested output size, 0 = native */
 	int black_level;
+	bool black_auto;		/* lower black_level from the darkest pixels */
+	double wb_bias_r, wb_bias_b;	/* user correction on top of auto white balance */
 	bool always_on;
 	int wait_s;		/* wait for the sensor to appear */
 	double target;		/* AE target, fraction of full scale (linear) */
@@ -300,6 +303,9 @@ struct cam {
 	uint32_t mbus_code;
 	unsigned int w, h, bpl;		/* raw */
 	unsigned int ow, oh;		/* output */
+	unsigned int bw, bh;		/* processed image before scaling (half size for Bayer) */
+	uint16_t *xmap, *ymap;		/* output pixel -> processed pixel (crop + scale) */
+	unsigned int sstep;		/* statistics: every sstep-th pixel and row (~10000 samples) */
 	int r_idx, b_idx;		/* positions in 2x2 Bayer block */
 	bool rot180;
 
@@ -743,18 +749,54 @@ static int create_loopback(struct cam *c)
 	return r < 0 && errno != EEXIST ? -1 : 0;
 }
 
+/*
+ * Output size and the crop/scale maps. Colour cameras are processed at half
+ * resolution (one RGB pixel per 2x2 Bayer block), then centre-cropped to the
+ * output's aspect ratio and scaled (nearest neighbour on the already
+ * averaged image) to the output size. Standard sizes like 1280x720 matter:
+ * Zoom and other strict V4L2 apps reject unusual ones.
+ */
+static void setup_maps(struct cam *c)
+{
+	unsigned int cw, ch, x0, y0;
+
+	c->bw = c->kind == KIND_BAYER ? c->w / 2 : c->w;
+	c->bh = c->kind == KIND_BAYER ? c->h / 2 : c->h;
+	c->ow = (c->out_w ? c->out_w : c->bw) & ~1u;
+	c->oh = c->out_h ? c->out_h : c->bh;
+
+	/* largest centred crop with the output's aspect ratio */
+	if ((uint64_t)c->bw * c->oh > (uint64_t)c->bh * c->ow) {
+		ch = c->bh;
+		cw = (unsigned int)((uint64_t)c->bh * c->ow / c->oh);
+	} else {
+		cw = c->bw;
+		ch = (unsigned int)((uint64_t)c->bw * c->oh / c->ow);
+	}
+	x0 = (c->bw - cw) / 2;
+	y0 = (c->bh - ch) / 2;
+
+	free(c->xmap);
+	free(c->ymap);
+	c->xmap = calloc(c->ow, sizeof(*c->xmap));
+	c->ymap = calloc(c->oh, sizeof(*c->ymap));
+	if (!c->xmap || !c->ymap)
+		die("out of memory");
+	for (unsigned int i = 0; i < c->ow; i++)
+		c->xmap[i] = (uint16_t)(x0 + (uint64_t)(2 * i + 1) * cw / (2 * c->ow));
+	for (unsigned int i = 0; i < c->oh; i++)
+		c->ymap[i] = (uint16_t)(y0 + (uint64_t)(2 * i + 1) * ch / (2 * c->oh));
+	c->sstep = (unsigned int)sqrt((double)c->ow * c->oh / 10000.0);
+	if (c->sstep < 1)
+		c->sstep = 1;
+}
+
 static void setup_output(struct cam *c)
 {
 	struct v4l2_format f;
 	struct v4l2_event_subscription sub;
 
-	if (c->kind == KIND_BAYER) {
-		c->ow = (c->w / 2) & ~1u;
-		c->oh = c->h / 2;
-	} else {
-		c->ow = c->w & ~1u;
-		c->oh = c->h;
-	}
+	setup_maps(c);
 
 	/* Use the device if it exists, otherwise create it through the
 	 * v4l2loopback control device (the module may still be loading at boot). */
@@ -791,6 +833,17 @@ static void setup_output(struct cam *c)
 	if (xioctl(c->out_fd, VIDIOC_S_FMT, &f) < 0)
 		die("Setting output format on %s failed: %s", c->output, strerror(errno));
 	c->out_size = f.fmt.pix.sizeimage;
+	{
+		/* Report 30 fps: some apps (Zoom) refuse a device without a frame rate. */
+		struct v4l2_streamparm parm;
+
+		memset(&parm, 0, sizeof(parm));
+		parm.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+		parm.parm.output.timeperframe.numerator = 1;
+		parm.parm.output.timeperframe.denominator = 30;
+		if (xioctl(c->out_fd, VIDIOC_S_PARM, &parm) < 0)
+			dbg("VIDIOC_S_PARM on %s: %s", c->output, strerror(errno));
+	}
 	c->out = calloc(1, c->out_size);
 	c->rgb_row = calloc(c->ow, 3);
 	c->line0 = calloc(c->w + 32, sizeof(uint16_t));
@@ -816,8 +869,8 @@ static void setup_output(struct cam *c)
 			c->always_on = true;
 		}
 	}
-	logmsg("output %s: %ux%u %s", c->output, c->ow, c->oh,
-	       c->kind == KIND_BAYER ? "YUYV" : "GREY");
+	logmsg("output %s: %ux%u %s at 30 fps; black level %d%s", c->output, c->ow, c->oh,
+	       c->kind == KIND_BAYER ? "YUYV" : "GREY", c->black_level, c->black_auto ? " (auto)" : "");
 }
 
 /* ---------------------------------------------------------- processing */
@@ -827,10 +880,25 @@ static inline uint8_t clamp8(int v)
 	return v < 0 ? 0 : v > 255 ? 255 : (uint8_t)v;
 }
 
+#define BL_HIST 256	/* black level histogram: raw values 0..255 */
+
 struct stats {
-	uint64_t sum_r, sum_g, sum_b, sum_y;
-	uint64_t n;
+	/* auto exposure: brightness after gains */
+	uint64_t sum_y, n;
+	/* white balance: well-exposed pixels, and the near-grey ones among them */
+	uint64_t sum_r, sum_g, sum_b, n_valid;
+	uint64_t gsum_r, gsum_g, gsum_b, n_grey;
+	/* black level: darkest raw values */
+	uint32_t hist[BL_HIST];
+	uint64_t n_raw;
 };
+
+static void raw_sample(struct stats *st, int v)
+{
+	if (v < BL_HIST)
+		st->hist[v]++;
+	st->n_raw++;
+}
 
 static void process_bayer(struct cam *c, const uint8_t *raw, struct stats *st)
 {
@@ -840,7 +908,8 @@ static void process_bayer(struct cam *c, const uint8_t *raw, struct stats *st)
 	const int gg = (int)lrint(c->soft_gain * norm * 256);
 	const int gb = (int)lrint(c->wb_b * c->soft_gain * norm * 256);
 	const int sat = (int)lrint(c->saturation * 256);
-	int g1_idx = -1, g2_idx = -1;
+	const int dark = 20;	/* below this (10-bit, after black) a pixel is too noisy for AWB */
+	int g1_idx = -1, g2_idx = -1, cur_row = -1;
 
 	for (int i = 0; i < 4; i++) {
 		if (i == c->r_idx || i == c->b_idx)
@@ -855,18 +924,24 @@ static void process_bayer(struct cam *c, const uint8_t *raw, struct stats *st)
 		const uint16_t *rows[2] = { c->line0, c->line1 };
 		unsigned int dy = c->rot180 ? c->oh - 1 - oy : oy;
 		uint8_t *dst = c->out + (size_t)dy * c->ow * 2;
-		bool sample_row = (oy & 7) == 0;
+		bool sample_row = oy % c->sstep == 0;
+		unsigned int scount = 0;
+		int sy = c->ymap[oy];
 
-		ipu3_unpack_line(raw + (size_t)(2 * oy) * c->bpl, c->line0, c->w);
-		ipu3_unpack_line(raw + (size_t)(2 * oy + 1) * c->bpl, c->line1, c->w);
+		if (sy != cur_row) {	/* rows repeat when scaling up */
+			ipu3_unpack_line(raw + (size_t)(2 * sy) * c->bpl, c->line0, c->w);
+			ipu3_unpack_line(raw + (size_t)(2 * sy + 1) * c->bpl, c->line1, c->w);
+			cur_row = sy;
+		}
 
 		for (unsigned int ox = 0; ox < c->ow; ox++) {
+			unsigned int sx = 2u * c->xmap[ox];
 			int px[4], r, g, b;
 
-			px[0] = rows[0][2 * ox];
-			px[1] = rows[0][2 * ox + 1];
-			px[2] = rows[1][2 * ox];
-			px[3] = rows[1][2 * ox + 1];
+			px[0] = rows[0][sx];
+			px[1] = rows[0][sx + 1];
+			px[2] = rows[1][sx];
+			px[3] = rows[1][sx + 1];
 			r = px[c->r_idx] - bl;
 			b = px[c->b_idx] - bl;
 			g = ((px[g1_idx] + px[g2_idx]) >> 1) - bl;
@@ -874,18 +949,43 @@ static void process_bayer(struct cam *c, const uint8_t *raw, struct stats *st)
 			if (g < 0) g = 0;
 			if (b < 0) b = 0;
 
-			if (sample_row && (ox & 7) == 0) {
-				st->sum_r += r;
-				st->sum_g += g;
-				st->sum_b += b;
-				st->n++;
+			bool sample = sample_row && scount-- == 0;
+
+			if (sample) {
+				int hi = px[0] > px[1] ? px[0] : px[1];
+
+				scount = c->sstep - 1;
+				hi = hi > px[2] ? hi : px[2];
+				hi = hi > px[3] ? hi : px[3];
+				for (int k = 0; k < 4; k++)
+					raw_sample(st, px[k]);
+				/* AWB only from pixels that are neither clipped nor noise */
+				if (hi < 1000 && r > dark && g > dark && b > dark) {
+					double cr = r * c->wb_r, cb = b * c->wb_b;
+					double mx = fmax(fmax(cr, g), cb), mn = fmin(fmin(cr, g), cb);
+
+					st->sum_r += r;
+					st->sum_g += g;
+					st->sum_b += b;
+					st->n_valid++;
+					/* near-grey with the current gains: what a grey-world
+					 * estimate should really be made of */
+					if (mx < 1.5 * mn) {
+						st->gsum_r += r;
+						st->gsum_g += g;
+						st->gsum_b += b;
+						st->n_grey++;
+					}
+				}
 			}
 
 			r = (r * gr) >> 8;
 			g = (g * gg) >> 8;
 			b = (b * gb) >> 8;
-			if (sample_row && (ox & 7) == 0)
+			if (sample) {
 				st->sum_y += (r * 77 + g * 150 + b * 29) >> 8;
+				st->n++;
+			}
 			uint8_t *p = c->rgb_row + 3 * ox;
 
 			p[0] = c->lut[r > 1023 ? 1023 : r];
@@ -920,27 +1020,85 @@ static void process_mono(struct cam *c, const uint8_t *raw, struct stats *st)
 {
 	const int bl = c->black_level;
 	const int gain = (int)lrint(c->soft_gain * 1023.0 / (1023 - bl) * 256);
+	int cur_row = -1;
 
 	for (unsigned int y = 0; y < c->oh; y++) {
 		unsigned int dy = c->rot180 ? c->oh - 1 - y : y;
 		uint8_t *dst = c->out + (size_t)dy * c->ow;
+		int sy = c->ymap[y];
 
-		ipu3_unpack_line(raw + (size_t)y * c->bpl, c->line0, c->w);
+		if (sy != cur_row) {
+			ipu3_unpack_line(raw + (size_t)sy * c->bpl, c->line0, c->w);
+			cur_row = sy;
+		}
 		for (unsigned int x = 0; x < c->ow; x++) {
-			int v = c->line0[x] - bl;
+			int raw_v = c->line0[c->xmap[x]];
+			int v = raw_v - bl;
 
 			if (v < 0)
 				v = 0;
 			v = (v * gain) >> 8;
 			if (v > 1023)
 				v = 1023;
-			if ((y & 7) == 0 && (x & 7) == 0) {
+			if (y % c->sstep == 0 && x % c->sstep == 0) {
+				raw_sample(st, raw_v);
 				st->sum_y += v;
 				st->n++;
 			}
 			dst[c->rot180 ? c->ow - 1 - x : x] = c->lut[v];
 		}
 	}
+}
+
+/*
+ * Black level for sensors without a known value: like libcamera's software
+ * ISP, only ever lower it, to the darkest 2% of the raw pixels. No pixel can
+ * be darker than black (apart from noise), so this never over-corrects.
+ */
+static void update_black_level(struct cam *c, const struct stats *st)
+{
+	uint64_t seen = 0, threshold = st->n_raw / 50;
+
+	if (!c->black_auto || st->n_raw < 200)
+		return;
+	for (int i = 0; i < BL_HIST && i < c->black_level; i++) {
+		seen += st->hist[i];
+		if (seen >= threshold) {
+			if (i < c->black_level) {
+				dbg("black level %d -> %d", c->black_level, i);
+				c->black_level = i;
+			}
+			return;
+		}
+	}
+}
+
+/*
+ * White balance: grey world over the near-grey pixels (with the current
+ * gains), which coloured walls, skin or sky don't pull off; plain grey world
+ * over all well-exposed pixels when there are too few of them. Then the
+ * user's --wb-bias.
+ */
+static void update_awb(struct cam *c, const struct stats *st)
+{
+	uint64_t r, g, b;
+	double wr, wb;
+
+	if (c->kind != KIND_BAYER)
+		return;
+	if (st->n_grey >= 16 && st->n_grey * 20 >= st->n_valid) {
+		r = st->gsum_r; g = st->gsum_g; b = st->gsum_b;
+	} else if (st->n_valid >= 16) {
+		r = st->sum_r; g = st->sum_g; b = st->sum_b;
+	} else {
+		return;		/* too dark or too clipped to judge */
+	}
+	if (!r || !b)
+		return;
+	wr = fmin(fmax((double)g / r * c->wb_bias_r, 0.4), 4.0);
+	wb = fmin(fmax((double)g / b * c->wb_bias_b, 0.4), 4.0);
+	c->wb_r += (wr - c->wb_r) * 0.15;
+	c->wb_b += (wb - c->wb_b) * 0.15;
 }
 
 /*
@@ -956,15 +1114,8 @@ static void update_3a(struct cam *c, const struct stats *st)
 	if (!st->n)
 		return;
 
-	if (c->kind == KIND_BAYER && st->sum_r && st->sum_b) {
-		double wr = (double)st->sum_g / st->sum_r;
-		double wb = (double)st->sum_g / st->sum_b;
-
-		wr = fmin(fmax(wr, 0.5), 4.0);
-		wb = fmin(fmax(wb, 0.5), 4.0);
-		c->wb_r += (wr - c->wb_r) * 0.15;
-		c->wb_b += (wb - c->wb_b) * 0.15;
-	}
+	update_black_level(c, st);
+	update_awb(c, st);
 
 	if (++c->frame % 3)
 		return;
@@ -1079,11 +1230,15 @@ static void usage(const char *argv0)
 		"  --sensor PREFIX   media entity name prefix instead of --camera\n"
 		"  --output DEV      v4l2loopback device (default /dev/video50 front,\n"
 		"                    /dev/video51 rear, /dev/video52 ir)\n"
-		"  --size WxH        sensor mode; colour output is half of this\n"
-		"                    (default 2592x1944 front, 3264x2448 rear)\n"
-		"  --black-level N   10-bit black level (default 64)\n"
+		"  --size WxH        sensor mode (default 2592x1944 front, 3264x2448 rear)\n"
+		"  --output-size WxH webcam size, centre-cropped to its aspect ratio\n"
+		"                    (default 1280x720 front/rear, native for ir;\n"
+		"                    \"native\" = half the sensor mode, uncropped)\n"
+		"  --black-level N|auto  10-bit black level (default 16 front, auto rear/ir)\n"
+		"  --wb-bias R,B     multiply the auto white balance red/blue gains,\n"
+		"                    e.g. 0.95,1.05 for a cooler picture (default 1,1)\n"
 		"  --target F        auto-exposure target, 0.05-0.5 (default 0.18)\n"
-		"  --saturation F    colour saturation (default 1.25)\n"
+		"  --saturation F    colour saturation (default 1.2)\n"
 		"  --ir-led PATH     IR flood LED sysfs dir (default: auto for --camera ir)\n"
 		"  --no-ir-led       never touch the IR LED\n"
 		"  --always-on       stream even with no application reading\n"
@@ -1099,6 +1254,8 @@ int main(int argc, char **argv)
 		{ "output", required_argument, NULL, 'o' },
 		{ "size", required_argument, NULL, 'S' },
 		{ "black-level", required_argument, NULL, 'b' },
+		{ "output-size", required_argument, NULL, 'O' },
+		{ "wb-bias", required_argument, NULL, 'B' },
 		{ "target", required_argument, NULL, 't' },
 		{ "saturation", required_argument, NULL, 'u' },
 		{ "ir-led", required_argument, NULL, 'l' },
@@ -1110,14 +1267,17 @@ int main(int argc, char **argv)
 	};
 	struct cam c;
 	const char *camera = NULL, *default_out = NULL;
-	unsigned int def_w = 0, def_h = 0;
+	unsigned int def_w = 0, def_h = 0, def_ow = 0, def_oh = 0;
+	int def_black = 64;
+	bool def_black_auto = true, black_given = false, out_given = false;
 	bool no_led = false;
 	int opt;
 
 	memset(&c, 0, sizeof(c));
 	c.black_level = 64;
 	c.target = 0.18;
-	c.saturation = 1.25;
+	c.saturation = 1.2;
+	c.wb_bias_r = c.wb_bias_b = 1.0;
 	c.soft_gain = 1.0;
 	c.wb_r = c.wb_b = 1.0;
 	c.sensor_fd = c.csi2_fd = c.video_fd = c.out_fd = c.media.fd = -1;
@@ -1131,7 +1291,29 @@ int main(int argc, char **argv)
 			if (sscanf(optarg, "%ux%u", &c.req_w, &c.req_h) != 2)
 				die("bad --size '%s'", optarg);
 			break;
-		case 'b': c.black_level = atoi(optarg); break;
+		case 'b':
+			black_given = true;
+			if (!strcmp(optarg, "auto")) {
+				c.black_auto = true;
+				c.black_level = 64;
+			} else {
+				c.black_auto = false;
+				c.black_level = atoi(optarg);
+			}
+			break;
+		case 'O':
+			out_given = true;
+			if (!strcmp(optarg, "native"))
+				c.out_w = c.out_h = 0;
+			else if (sscanf(optarg, "%ux%u", &c.out_w, &c.out_h) != 2 || c.out_w < 2 || c.out_h < 2 ||
+				 c.out_w > 4096 || c.out_h > 4096)
+				die("bad --output-size '%s' (WxH or native)", optarg);
+			break;
+		case 'B':
+			if (sscanf(optarg, "%lf,%lf", &c.wb_bias_r, &c.wb_bias_b) != 2 ||
+			    c.wb_bias_r < 0.25 || c.wb_bias_r > 4 || c.wb_bias_b < 0.25 || c.wb_bias_b > 4)
+				die("bad --wb-bias '%s' (R,B between 0.25 and 4)", optarg);
+			break;
 		case 't': c.target = atof(optarg); break;
 		case 'u': c.saturation = atof(optarg); break;
 		case 'l': c.led_path = optarg; break;
@@ -1148,12 +1330,18 @@ int main(int argc, char **argv)
 			c.sensor_prefix = "ov5693";
 			default_out = "/dev/video50";
 			c.label = "Surface Front Camera";
-			def_w = 2592, def_h = 1944;	/* -> 1296x972 output */
+			def_w = 2592, def_h = 1944;
+			def_ow = 1280, def_oh = 720;
+			/* libcamera's sensor database: 1024 at 16 bits = 16 at 10 bits.
+			 * (64 crushed the blue channel in shadows: a yellow picture.) */
+			def_black = 16;
+			def_black_auto = false;
 		} else if (!strcmp(camera, "rear")) {
 			c.sensor_prefix = "ov8865";
 			default_out = "/dev/video51";
 			c.label = "Surface Rear Camera";
-			def_w = 3264, def_h = 2448;	/* -> 1632x1224 output */
+			def_w = 3264, def_h = 2448;
+			def_ow = 1280, def_oh = 720;
 		} else if (!strcmp(camera, "ir")) {
 			c.sensor_prefix = "ov7251";
 			default_out = "/dev/video52";
@@ -1166,6 +1354,14 @@ int main(int argc, char **argv)
 	if (!c.req_w && !c.req_h) {
 		c.req_w = def_w;
 		c.req_h = def_h;
+	}
+	if (!out_given) {
+		c.out_w = def_ow;
+		c.out_h = def_oh;
+	}
+	if (!black_given) {
+		c.black_level = def_black;
+		c.black_auto = def_black_auto;
 	}
 	if (!c.sensor_prefix || !c.output) {
 		usage(argv[0]);

@@ -6,8 +6,8 @@ publishes each camera as an ordinary webcam:
 
 | Device | Camera | Format |
 |---|---|---|
-| `/dev/video50` | Surface Front Camera | YUYV, 1296x972 |
-| `/dev/video51` | Surface Rear Camera | YUYV, 1632x1224 |
+| `/dev/video50` | Surface Front Camera | YUYV, 1280x720, 30 fps |
+| `/dev/video51` | Surface Rear Camera | YUYV, 1280x720, 30 fps |
 | `/dev/video52` | Surface IR Camera | GREY, 640x480 |
 
 Any app that uses webcams can open these devices: Firefox, Chrome, Zoom,
@@ -68,8 +68,10 @@ Set options in `/etc/default/surface-camd`, for example
 |---|---|---|
 | `--size WxH` | 2592x1944 / 3264x2448 | Sensor mode. Use a smaller mode (e.g. `--size 1632x1224` on the rear camera) to lower CPU use |
 | `--target F` | 0.18 | Auto-exposure brightness target |
-| `--saturation F` | 1.25 | Colour saturation |
-| `--black-level N` | 64 | Sensor black level (10-bit) |
+| `--output-size WxH` | 1280x720 (front/rear), native (IR) | Webcam size, centre-cropped to its aspect ratio. Standard sizes matter for Zoom; `native` gives the full half-resolution image |
+| `--wb-bias R,B` | 1,1 | Fine-tune the automatic white balance: e.g. `0.95,1.08` for a cooler, bluer picture, `1.05,0.95` for a warmer one |
+| `--saturation F` | 1.2 | Colour saturation |
+| `--black-level N\|auto` | 16 (front), auto (rear, IR) | Sensor black level (10-bit). `auto` starts at 64 and lowers it to the darkest pixels, like libcamera's software ISP |
 | `--no-ir-led` | | Don't switch the IR LED |
 | `--always-on` | | Stream even when no app is reading |
 | `-v` | | Log auto-exposure and white-balance decisions |
@@ -83,6 +85,18 @@ and you want to keep using it, enable only the IR instance
 offering the libcamera versions of the cameras.
 
 ## Troubleshooting
+
+- **Colours look yellow or warm.** Before 0.3.0 the black level was 64 for every
+  sensor. The front OV5693's is 16 (libcamera's sensor database), and
+  subtracting too much clipped the blue channel in darker areas. 0.3.0 uses
+  16 on the front camera and measures it on the others. White balance now
+  works from near-grey pixels, so a coloured wall or face doesn't tint the
+  picture. If it's still not to your taste, add for example
+  `SURFACE_CAMD_ARGS="--wb-bias 0.95,1.08"` to `/etc/default/surface-camd`.
+- **Zoom (and other strict apps).** The cameras are 1280x720 YUYV at 30 fps,
+  capture-only devices (v4l2loopback "exclusive caps"), which is what Zoom
+  expects. In Zoom: Settings → Video → Camera → "Surface Front Camera".
+  The camera starts when Zoom opens it, which takes about a second.
 
 `journalctl -u surface-camd@front` explains failures:
 
